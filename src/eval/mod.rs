@@ -152,6 +152,24 @@ pub fn eval_string(
     result
 }
 
+#[comemo::memoize]
+pub fn eval_lua(
+    world: Tracked<dyn World>,
+    route: Tracked<Route>,
+    tracer: TrackedMut<Tracer>,
+    source: &Source,
+) -> SourceResult<Module> {
+    // Prevent cyclic evaluation.
+    let id = source.id();
+    let path = if id.is_detached() { Path::new("") } else { world.source(id).path() };
+    if route.contains(id) {
+        panic!("Tried to cyclicly evaluate {}", path.display());
+    }
+
+    let span = source.root().span();
+    panic!("Lua module evaluation is not implemented yet!");
+}
+
 /// A virtual machine.
 ///
 /// Holds the state needed to [evaluate](eval) Typst sources. A new
@@ -1548,8 +1566,14 @@ fn import(vm: &mut Vm, source: Value, span: Span) -> SourceResult<Module> {
     // Evaluate the file.
     let source = world.source(id);
     let point = || Tracepoint::Import;
-    eval(world, vm.route, TrackedMut::reborrow_mut(&mut vm.vt.tracer), source)
-        .trace(world, point, span)
+
+    if path.ends_with(StrPattern::Str(".lua".into())) {
+        eval_lua(world, vm.route, TrackedMut::reborrow_mut(&mut vm.vt.tracer), source)
+            .trace(world, point, span)
+    } else {
+        eval(world, vm.route, TrackedMut::reborrow_mut(&mut vm.vt.tracer), source)
+            .trace(world, point, span)
+    }
 }
 
 impl Eval for ast::LoopBreak {

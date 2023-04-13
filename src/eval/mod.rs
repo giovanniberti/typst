@@ -40,6 +40,7 @@ pub(crate) use self::methods::methods_on;
 use std::collections::HashSet;
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use comemo::{Track, Tracked, TrackedMut};
 use ecow::EcoVec;
@@ -58,7 +59,8 @@ use crate::syntax::{
 };
 use crate::util::PathExt;
 use crate::World;
-use rlua::Lua;
+use rlua::{Lua, Function as LuaFunction};
+use rlua::Error::ExternalError;
 
 const MAX_ITERATIONS: usize = 10_000;
 const MAX_CALL_DEPTH: usize = 64;
@@ -172,8 +174,25 @@ pub fn eval_lua(
 
     let lua = Lua::new();
     lua.context(|ctx| {
-        ctx.load(module_contents).exec()
+        let globals = ctx.globals();
+        ctx.load(module_contents).exec()?;
+
+        let layout_defined = globals.contains_key("layout")?;
+
+        if !layout_defined {
+            let err: Box<dyn std::error::Error + Send + Sync> = From::from("Missing `layout` function!");
+            return Err(ExternalError(Arc::from(err)));
+       }
+
+        let layout: LuaFunction = globals.get("layout")?;
+        layout.call::<_, ()>(())
     }).map_err(|e| Box::new(vec![SourceError::new(span, format!("Error while executing lua module `{}`: {}", path.to_string_lossy(), e))]))?;
+
+    let name = path.file_stem().unwrap_or_default().to_string_lossy();
+    // TODO: Use `with_scope` to introduce new bindings
+    // TODO: Use `with_content` to pass generated content
+
+    Ok(Module::new(name))
 }
 
 /// A virtual machine.

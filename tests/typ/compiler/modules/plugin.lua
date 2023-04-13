@@ -1,1 +1,3 @@
-print("hello from lua!")
+function layout()
+    print("hello from lua!")
+end

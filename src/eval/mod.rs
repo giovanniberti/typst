@@ -58,6 +58,7 @@ use crate::syntax::{
 };
 use crate::util::PathExt;
 use crate::World;
+use rlua::Lua;
 
 const MAX_ITERATIONS: usize = 10_000;
 const MAX_CALL_DEPTH: usize = 64;
@@ -167,7 +168,12 @@ pub fn eval_lua(
     }
 
     let span = source.root().span();
-    panic!("Lua module evaluation is not implemented yet!");
+    let module_contents = source.text();
+
+    let lua = Lua::new();
+    lua.context(|ctx| {
+        ctx.load(module_contents).exec()
+    }).map_err(|e| Box::new(vec![SourceError::new(span, format!("Error while executing lua module `{}`: {}", path.to_string_lossy(), e))]))?;
 }
 
 /// A virtual machine.

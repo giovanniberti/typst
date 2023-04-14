@@ -19,6 +19,7 @@ mod module;
 mod ops;
 mod scope;
 mod symbol;
+mod lua;
 
 #[doc(hidden)]
 pub use once_cell::sync::Lazy;
@@ -40,10 +41,10 @@ pub(crate) use self::methods::methods_on;
 use std::collections::HashSet;
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use comemo::{Track, Tracked, TrackedMut};
-use ecow::EcoVec;
+use ecow::{EcoString, EcoVec};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::diag::{
@@ -175,6 +176,16 @@ pub fn eval_lua(
     let lua = Lua::new();
     lua.context(|ctx| {
         let globals = ctx.globals();
+
+        let library = Arc::new(world.library().clone());
+
+        let text =
+            ctx.create_function(move |_, str: String| {
+                println!("Calling built-in text from lua");
+                Ok((library.items.text)(EcoString::from(str)))
+            })?;
+        globals.set("text", text)?;
+
         ctx.load(module_contents).exec()?;
 
         let layout_defined = globals.contains_key("layout")?;
@@ -189,10 +200,22 @@ pub fn eval_lua(
     }).map_err(|e| Box::new(vec![SourceError::new(span, format!("Error while executing lua module `{}`: {}", path.to_string_lossy(), e))]))?;
 
     let name = path.file_stem().unwrap_or_default().to_string_lossy();
-    // TODO: Use `with_scope` to introduce new bindings
-    // TODO: Use `with_content` to pass generated content
 
-    Ok(Module::new(name))
+    // TODO: Use `with_scope` to introduce new bindings
+    let mut scope = Scope::new();
+    scope.define("layout", Func::from(LuaFunc::new(
+        FuncInfo {
+            name: "layout",
+            display: "layout",
+            docs: "",
+            params: Vec::new(),
+            returns: Vec::new(),
+            category: ""
+        },
+        Arc::new(Mutex::new(lua))
+    )));
+
+    Ok(Module::new(name).with_scope(scope))
 }
 
 /// A virtual machine.

@@ -2,10 +2,13 @@ pub use typst_macros::func;
 
 use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use comemo::{Prehashed, Track, Tracked, TrackedMut};
 use once_cell::sync::Lazy;
+use rlua::{Function, Lua};
+use typst::diag::SourceError;
+use typst::model::Content;
 
 use super::{
     cast_to_value, Args, CastInfo, Eval, Flow, Route, Scope, Scopes, Tracer, Value, Vm,
@@ -37,6 +40,8 @@ enum Repr {
     Closure(Arc<Prehashed<Closure>>),
     /// A nested function with pre-applied arguments.
     With(Arc<(Func, Args)>),
+    /// A function defined inside a Lua module
+    Lua(LuaFunc)
 }
 
 impl Func {
@@ -47,6 +52,7 @@ impl Func {
             Repr::Elem(func) => Some(func.info().name),
             Repr::Closure(closure) => closure.name.as_deref(),
             Repr::With(arc) => arc.0.name(),
+            Repr::Lua(func) => Some(func.info.name)
         }
     }
 
@@ -57,6 +63,7 @@ impl Func {
             Repr::Elem(func) => Some(func.info()),
             Repr::Closure(_) => None,
             Repr::With(arc) => arc.0.info(),
+            Repr::Lua(func) => Some(&func.info)
         }
     }
 
@@ -106,6 +113,20 @@ impl Func {
             Repr::With(arc) => {
                 args.items = arc.1.items.iter().cloned().chain(args.items).collect();
                 arc.0.call_vm(vm, args)
+            },
+            Repr::Lua(func_handle) => {
+                let lua = func_handle.lua.lock().expect("Unable to lock lua interpreter instance");
+                let result = lua.context(|ctx| {
+                    let globals = ctx.globals();
+
+                    let lua_function: Function = globals.get(func_handle.info.name)?;
+
+                    // FIXME: Evaluate Lua function with correct arg types here
+                    lua_function.call::<_, Content>(())
+                }).map_err(|e| Box::new(vec![SourceError::new(self.span, format!("Error while executing lua function `{}`: {}", func_handle.info.name, e))]))?;
+
+                // FIXME: Handle `Value` properly
+                Ok(Value::Content(result))
             }
         }
     }
@@ -508,6 +529,42 @@ impl<'a> CapturesVisitor<'a> {
             if let Ok(value) = self.external.get_in_math(&ident) {
                 self.captures.define_captured(ident.take(), value.clone());
             }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LuaFunc {
+    info: FuncInfo,
+    lua: Arc<Mutex<Lua>>
+}
+
+impl LuaFunc {
+    pub fn new(info: FuncInfo, lua: Arc<Mutex<Lua>>) -> LuaFunc {
+        Self {
+            info,
+            lua,
+        }
+    }
+}
+
+impl PartialEq for LuaFunc {
+    fn eq(&self, other: &Self) -> bool {
+        self.info.name == other.info.name
+    }
+}
+
+impl Hash for LuaFunc {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.info.name.hash(state)
+    }
+}
+
+impl From<LuaFunc> for Func {
+    fn from(f: LuaFunc) -> Self {
+        Func {
+            repr: Repr::Lua(f),
+            span: Span::detached()
         }
     }
 }

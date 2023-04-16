@@ -30,6 +30,7 @@ pub use self::cast::*;
 pub use self::dict::*;
 pub use self::func::*;
 pub use self::library::*;
+use self::lua::LuaWorld;
 pub use self::module::*;
 pub use self::scope::*;
 pub use self::str::*;
@@ -38,13 +39,16 @@ pub use self::value::*;
 
 pub(crate) use self::methods::methods_on;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+use std::error::Error;
 use std::mem;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::str::FromStr;
 
 use comemo::{Track, Tracked, TrackedMut};
-use ecow::{EcoString, EcoVec};
+use ecow::EcoVec;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::diag::{
@@ -62,6 +66,7 @@ use crate::util::PathExt;
 use crate::World;
 use rlua::{Lua, Function as LuaFunction};
 use rlua::Error::ExternalError;
+use crate::geom::{Color, RgbaColor};
 
 const MAX_ITERATIONS: usize = 10_000;
 const MAX_CALL_DEPTH: usize = 64;
@@ -172,17 +177,92 @@ pub fn eval_lua(
 
     let span = source.root().span();
     let module_contents = source.text();
+    let library = world.library().clone();
 
     let lua = Lua::new();
     lua.context(|ctx| {
         let globals = ctx.globals();
 
-        let library = Arc::new(world.library().clone());
-
         let text =
-            ctx.create_function(move |_, str: String| {
-                println!("Calling built-in text from lua");
-                Ok((library.items.text)(EcoString::from(str)))
+            ctx.create_function(move |_, (str, options): (String, Option<HashMap<String, String>>)| {
+                let mut lua_world = LuaWorld::new(library.clone());
+                let id = SourceId::detached();
+                let scopes = Scopes::new(Some(lua_world.library()));
+                let mut provider = StabilityProvider::new();
+                let introspector = Introspector::new(&[]);
+
+                let m: &(dyn World + 'static) = &lua_world;
+
+                let mut lua_tracer = Tracer::new(None);
+                let vt = Vt {
+                    world: m.track(),
+                    tracer: lua_tracer.track_mut(),
+                    provider: provider.track_mut(),
+                    introspector: introspector.track(),
+                };
+
+                let lua_route = Route::new(id);
+                let mut vm = Vm::new(vt, lua_route.track(), id, scopes);
+
+                let fill_arg = options
+                    .and_then(|m| m.get("fill").cloned())
+                    .map(|c| {
+                        RgbaColor::from_str(&c)
+                            .map_err(|s| {
+                                let err: Box<dyn std::error::Error + Send + Sync> = From::from(format!("Invalid RGB color string: {}", s));
+                                ExternalError(Arc::from(err))
+                            })
+                    })
+                    .map(|r| {
+                        r
+                            .map(Color::Rgba)
+                            .map(|c| Value::Color(c))
+                            .map(|v| Arg {
+                                span: Span::detached(),
+                                name: Some(Str::from("fill")),
+                                value: Spanned {
+                                    span: Span::detached(),
+                                    v,
+                                },
+                            })
+                    });
+
+                let parsed_args: rlua::Result<Vec<Option<Arg>>> = vec![fill_arg].into_iter()
+                    .map(|a| a.transpose())
+                    .collect();
+
+                let node = super::syntax::parse(&str);
+                let content_arg = ast::Markup::from_untyped(&node).ok_or_else(|| {
+                    let err: Box<dyn Error + Send + Sync> = From::from(format!("Invalid content: {}. Parsed argument kind: {}", str, node.kind().name()));
+                    ExternalError(Arc::from(err))
+                })?;
+
+                let content = content_arg.eval(&mut vm)
+                    .map_err(|s| {
+                        let err: Box<dyn Error + Send + Sync> = From::from(format!("Invalid `text` content evaluation: {}", str));
+                        ExternalError(Arc::from(err))
+                    })?;
+
+                let mut args = parsed_args.map(|a| {
+                    Args {
+                        span: Span::detached(),
+                        items: EcoVec::from_iter(a.into_iter().filter_map(|el| el)
+                            .chain(std::iter::once(Arg {
+                                span: Span::detached(),
+                                name: None,
+                                value: Spanned {
+                                    span: Span::detached(),
+                                    v: Value::Content(content),
+                                },
+                            }))),
+                    }
+                })?;
+
+                library.items.text_func.construct(&mut vm, &mut args)
+                    .map_err(|e| {
+                        let err: Box<dyn Error + Send + Sync> = From::from("Error while calling `text` element function!");
+                        ExternalError(Arc::from(err))
+                    })
             })?;
         globals.set("text", text)?;
 
@@ -191,17 +271,16 @@ pub fn eval_lua(
         let layout_defined = globals.contains_key("layout")?;
 
         if !layout_defined {
-            let err: Box<dyn std::error::Error + Send + Sync> = From::from("Missing `layout` function!");
+            let err: Box<dyn Error + Send + Sync> = From::from("Missing `layout` function!");
             return Err(ExternalError(Arc::from(err)));
-       }
+        }
 
         let layout: LuaFunction = globals.get("layout")?;
         layout.call::<_, ()>(())
-    }).map_err(|e| Box::new(vec![SourceError::new(span, format!("Error while executing lua module `{}`: {}", path.to_string_lossy(), e))]))?;
+    }).map_err(|e| Box::new(vec![SourceError::new(span, format!("Error while executing lua module `{}`: {}\nsource: {}", path.to_string_lossy(), e, e.source().map(|e| format!("{}", e)).unwrap_or("N/A".to_string())))]))?;
 
     let name = path.file_stem().unwrap_or_default().to_string_lossy();
 
-    // TODO: Use `with_scope` to introduce new bindings
     let mut scope = Scope::new();
     scope.define("layout", Func::from(LuaFunc::new(
         FuncInfo {
@@ -210,9 +289,9 @@ pub fn eval_lua(
             docs: "",
             params: Vec::new(),
             returns: Vec::new(),
-            category: ""
+            category: "",
         },
-        Arc::new(Mutex::new(lua))
+        Arc::new(Mutex::new(lua)),
     )));
 
     Ok(Module::new(name).with_scope(scope))
@@ -417,7 +496,7 @@ impl Eval for ast::Markup {
 /// Evaluate a stream of markup.
 fn eval_markup(
     vm: &mut Vm,
-    exprs: &mut impl Iterator<Item = ast::Expr>,
+    exprs: &mut impl Iterator<Item=ast::Expr>,
 ) -> SourceResult<Content> {
     let flow = vm.flow.take();
     let mut seq = Vec::with_capacity(exprs.size_hint().1.unwrap_or_default());
@@ -529,7 +608,7 @@ impl Eval for ast::Expr {
             Self::Continue(v) => v.eval(vm),
             Self::Return(v) => v.eval(vm),
         }?
-        .spanned(span);
+            .spanned(span);
 
         if vm.traced == Some(span) {
             vm.vt.tracer.trace(v.clone());
@@ -848,7 +927,7 @@ impl Eval for ast::Code {
 /// Evaluate a stream of expressions.
 fn eval_code(
     vm: &mut Vm,
-    exprs: &mut impl Iterator<Item = ast::Expr>,
+    exprs: &mut impl Iterator<Item=ast::Expr>,
 ) -> SourceResult<Value> {
     let flow = vm.flow.take();
     let mut output = Value::None;
@@ -1131,10 +1210,10 @@ impl Eval for ast::FuncCall {
             return Ok(Value::Content(
                 callee.display().spanned(callee_span)
                     + (vm.items.math_delimited)(
-                        (vm.items.text)('('.into()),
-                        body,
-                        (vm.items.text)(')'.into()),
-                    ),
+                    (vm.items.text)('('.into()),
+                    body,
+                    (vm.items.text)(')'.into()),
+                ),
             ));
         }
 

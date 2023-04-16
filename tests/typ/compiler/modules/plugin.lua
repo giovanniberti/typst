@@ -1,4 +1,4 @@
 function layout()
     print "hello from lua!"
-    return text("42")
+    return text("*aaa*", { fill = "#ff9900" })
 end

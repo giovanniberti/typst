@@ -25,6 +25,7 @@ bitflags = "1"
 bytemuck = "1"
 comemo = "0.2.1"
 ecow = "0.1"
+elsa = "1.7"
 flate2 = "1"
 if_chain = "1"
 image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif"] }

@@ -1635,6 +1635,7 @@ dependencies = [
  "bytemuck",
  "comemo",
  "ecow",
+ "elsa",
  "flate2",
  "if_chain",
  "image",
